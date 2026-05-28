@@ -65,14 +65,40 @@ def _read_table(
     path: Path,
     dtype: Optional[dict] = None,
     sheet_name: Optional[str] = None,
+    keep_cols: Optional[set] = None,
 ) -> pd.DataFrame:
-    """Route by extension. CSVs use latin-1 per IPEDS quirk rules."""
+    """Route by extension. CSVs use latin-1 per IPEDS quirk rules.
+
+    keep_cols, if provided, restricts loading to that set of columns (plus any
+    that happen to be absent — callable usecols is tolerant of missing names,
+    which matters for HD's optional C21BASIC/C00CARNEGIE columns that exist in
+    some years but not others). This is a memory optimization for Streamlit
+    Cloud's 1 GB tier: C_A files have ~23 columns of which only 7 are used.
+    """
     suffix = path.suffix.lower()
+    # BOM-tolerant column matcher: IPEDS CSVs sometimes prefix the first
+    # column name with a UTF-8 BOM. _clean_columns strips it later, but
+    # usecols runs before that. Strip both the unicode BOM (﻿) and the
+    # latin-1 representation of the UTF-8 BOM bytes (ï»¿), since CSVs are
+    # decoded as latin-1.
+    def _col_filter(col: str) -> bool:
+        if keep_cols is None:
+            return True
+        cleaned = col.lstrip('﻿').lstrip('ï»¿').strip()
+        return cleaned in keep_cols
+
     if suffix in ('.xlsx', '.xls'):
-        # Default to the first sheet unless caller specifies one.
         df = pd.read_excel(path, dtype=dtype, sheet_name=sheet_name or 0)
+        if keep_cols is not None:
+            df = df.loc[:, [c for c in df.columns if _col_filter(c)]]
     elif suffix == '.csv':
-        df = pd.read_csv(path, encoding='latin-1', dtype=dtype, low_memory=False)
+        df = pd.read_csv(
+            path,
+            encoding='latin-1',
+            dtype=dtype,
+            low_memory=False,
+            usecols=_col_filter if keep_cols is not None else None,
+        )
     else:
         raise ValueError(f'Unsupported file extension for {path.name}: {path.suffix}')
     return _clean_columns(df)
@@ -130,7 +156,8 @@ def load_hd(year: int, raw_dir: Path) -> pd.DataFrame:
         raise FileNotFoundError(f'Missing HD file for year {year} in {raw_dir}')
     console.log(f'[cyan]HD {year}[/] ← {path.name}')
 
-    df = _read_table(path)
+    hd_keep = set(HD_REQUIRED_COLS) | set(HD_OPTIONAL_COLS)
+    df = _read_table(path, keep_cols=hd_keep)
     raw_rows = len(df)
 
     missing = [c for c in HD_REQUIRED_COLS if c not in df.columns]
@@ -170,7 +197,7 @@ def load_ca(year: int, raw_dir: Path) -> pd.DataFrame:
         raise FileNotFoundError(f'Missing C_A file for year {year} in {raw_dir}')
     console.log(f'[cyan]C_A {year}[/] ← {path.name}')
 
-    df = _read_table(path, dtype={'CIPCODE': str})
+    df = _read_table(path, dtype={'CIPCODE': str}, keep_cols=set(CA_REQUIRED_COLS))
     raw_rows = len(df)
 
     missing = [c for c in CA_REQUIRED_COLS if c not in df.columns]
